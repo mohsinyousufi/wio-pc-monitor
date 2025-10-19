@@ -39,17 +39,23 @@ if ($VerboseMode) { $ArgsList += @('--verbose') }
 
 # Create a wrapper PowerShell script that activates venv and runs sender
 $RunnerPath = Join-Path $RepoRoot 'scripts\run_sender.ps1'
+# Build argument items string for embedding
+$ArgsItems = ($ArgsList | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ', '
 $RunnerContent = @"
 # Auto-generated runner for Wio PC Monitor sender
 `$RepoRoot = Split-Path -Parent `$PSScriptRoot
 `$Pythonw = Join-Path `$RepoRoot '.venv\Scripts\pythonw.exe'
 `$Sender = Join-Path `$RepoRoot 'pc\pc_stats_sender.py'
-`$ScriptArgs = @({0})
+# Prepare log directory under LocalAppData
+`$LogDir = Join-Path `$env:LOCALAPPDATA 'wio-pc-monitor'
+if (!(Test-Path `$LogDir)) { New-Item -ItemType Directory -Path `$LogDir | Out-Null }
+`$LogFile = Join-Path `$LogDir 'sender.log'
+`$ScriptArgs = @($ArgsItems) + @('--log-file', `$LogFile, '--open-wait', '0.3')
 # Build argument list: script path + arguments
 `$AllArgs = @(`$Sender) + `$ScriptArgs
 # Start sender hidden (no console) using pythonw
 Start-Process -FilePath `$Pythonw -ArgumentList `$AllArgs -WorkingDirectory `$RepoRoot -WindowStyle Hidden
-"@ -f ( ($ArgsList | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ', ' )
+"@
 Set-Content -LiteralPath $RunnerPath -Value $RunnerContent -Encoding UTF8
 
 # Register Scheduled Task

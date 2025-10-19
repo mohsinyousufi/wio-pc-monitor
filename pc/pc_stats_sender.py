@@ -2,7 +2,8 @@ import argparse
 import sys
 import time
 import platform
-from typing import Optional
+import atexit
+from typing import Optional, Tuple
 
 import psutil
 import serial
@@ -22,6 +23,15 @@ BAUD_RATE = 115200
 SEND_INTERVAL_SEC = 0.5
 
 
+"""Lightweight, resilient metrics sender.
+
+Changes:
+- Optional file logging (--log-file)
+- Configurable serial open wait (--open-wait, default 0.5s)
+- Cache LibreHardwareMonitor WMI object across reads
+- Initialize NVML once and reuse handle instead of per-iteration init
+"""
+
 # Try to load NVIDIA NVML for GPU metrics
 try:
     import pynvml  # type: ignore
@@ -29,13 +39,23 @@ try:
 except Exception:
     NVML_AVAILABLE = False
 
+# Globals for cached providers
+LHM_WMI = None  # LibreHardwareMonitor WMI connection (if any)
+NVML_INIT = False
+NVML_HANDLE = None
+
 # Try to connect to LibreHardwareMonitor WMI
 def get_lhm_wmi():
+    global LHM_WMI
+    if LHM_WMI is not None:
+        return LHM_WMI
     if not IS_WINDOWS or wmi is None:
         return None
     try:
-        return wmi.WMI(namespace='root\\LibreHardwareMonitor')
+        LHM_WMI = wmi.WMI(namespace='root\\LibreHardwareMonitor')
+        return LHM_WMI
     except Exception:
+        LHM_WMI = None
         return None
 
 
@@ -93,29 +113,43 @@ def get_gpu_metrics_lhm(lhm):
 
 
 
-def get_gpu_metrics_nvml() -> tuple[float, float]:
+def init_nvml_once() -> None:
+    """Initialize NVML once and cache first device handle."""
+    global NVML_INIT, NVML_HANDLE
+    if NVML_INIT or not NVML_AVAILABLE:
+        return
+    try:
+        pynvml.nvmlInit()
+        if pynvml.nvmlDeviceGetCount() > 0:
+            NVML_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(0)
+        NVML_INIT = True
+        atexit.register(lambda: _nvml_shutdown_safe())
+    except Exception:
+        NVML_INIT = False
+        NVML_HANDLE = None
+
+
+def _nvml_shutdown_safe() -> None:
+    try:
+        if NVML_AVAILABLE:
+            pynvml.nvmlShutdown()
+    except Exception:
+        pass
+
+
+def get_gpu_metrics_nvml() -> Tuple[float, float]:
     """Return (gpu_usage_percent, gpu_temp_c) using NVML. -1, -1 if unavailable."""
     if not NVML_AVAILABLE:
         return -1.0, -1.0
+    if not NVML_INIT:
+        init_nvml_once()
+    if NVML_HANDLE is None:
+        return -1.0, -1.0
     try:
-        pynvml.nvmlInit()
-        count = pynvml.nvmlDeviceGetCount()
-        if count < 1:
-            pynvml.nvmlShutdown()
-            return -1.0, -1.0
-        # Use first GPU
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-        gpu_usage = float(util.gpu)
-        gpu_temp = float(temp)
-        pynvml.nvmlShutdown()
-        return gpu_usage, gpu_temp
+        util = pynvml.nvmlDeviceGetUtilizationRates(NVML_HANDLE)
+        temp = pynvml.nvmlDeviceGetTemperature(NVML_HANDLE, pynvml.NVML_TEMPERATURE_GPU)
+        return float(util.gpu), float(temp)
     except Exception:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
         return -1.0, -1.0
 
 
@@ -136,15 +170,31 @@ def get_metrics() -> tuple[float, float, float, float, float]:
     return cpu, temp_c, ram, gpu_usage, gpu_temp
 
 
-def open_serial(port: str) -> Optional[serial.Serial]:
+def open_serial(port: str, open_wait: float) -> Optional[serial.Serial]:
     try:
         ser = serial.Serial(port=port, baudrate=BAUD_RATE, timeout=1)
-        # Give device a moment to reset on connect (typical for Arduino-like boards)
-        time.sleep(2.0)
+        # Give device a brief moment to reset (configurable)
+        time.sleep(max(0.0, float(open_wait)))
         return ser
     except Exception as e:
-        print(f"[warn] Could not open {port}: {e}")
+        log_print(f"[warn] Could not open {port}: {e}")
         return None
+
+
+LOG_FILE = None  # type: Optional[str]
+
+
+def log_print(msg: str) -> None:
+    try:
+        print(msg)
+    except Exception:
+        pass
+    if LOG_FILE:
+        try:
+            with open(LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(time.strftime('%Y-%m-%d %H:%M:%S') + ' ' + msg + '\n')
+        except Exception:
+            pass
 
 
 def main() -> int:
@@ -154,35 +204,50 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print metrics without opening serial")
     parser.add_argument("--list-ports", action="store_true", help="List available serial ports and exit")
     parser.add_argument("--verbose", action="store_true", help="Print each line sent")
+    parser.add_argument("--log-file", help="Append logs to this file (optional)")
+    parser.add_argument("--open-wait", type=float, default=0.5, help="Seconds to wait after opening serial (default 0.5)")
+    parser.add_argument("--open-retries", type=int, default=20, help="Retries to open/find serial before exit (default 20)")
     args = parser.parse_args()
+
+    global LOG_FILE
+    LOG_FILE = args.log_file or None
 
     if args.list_ports:
         ports = list_ports()
         if not ports:
-            print("No serial ports found.")
+            log_print("No serial ports found.")
             return 0
-        print("Available serial ports:")
+        log_print("Available serial ports:")
         for p in ports:
-            print(f"- {p.device}: {p.description}")
+            log_print(f"- {p.device}: {p.description}")
         return 0
 
-    port = find_serial_port(args.port)
-    if not args.dry_run and not port:
-        print("[error] No serial port found. Specify --port COMx or plug in the Wio Terminal.")
-        return 2
-
     ser = None
+    selected_port: Optional[str] = None
     if not args.dry_run:
-        ser = open_serial(port)
+        attempts = 0
+        while attempts < max(1, int(args.open_retries)) and ser is None:
+            selected_port = find_serial_port(args.port)
+            if not selected_port:
+                log_print(f"[warn] No serial port found (attempt {attempts+1}). Retrying...")
+                attempts += 1
+                time.sleep(1.0)
+                continue
+            ser = open_serial(selected_port, args.open_wait)
+            if not ser:
+                log_print(f"[warn] Open failed for {selected_port} (attempt {attempts+1}). Retrying...")
+                attempts += 1
+                time.sleep(1.0)
         if not ser:
+            log_print("[error] Could not open serial port after retries. Exiting.")
             return 2
         # Show a quick summary of ports and selection
         ports = list_ports()
         if ports:
-            print("[info] Ports detected:")
+            log_print("[info] Ports detected:")
             for p in ports:
-                print(f"  - {p.device}: {p.description}")
-        print(f"[info] Using port: {port} @ {BAUD_RATE}")
+                log_print(f"  - {p.device}: {p.description}")
+        log_print(f"[info] Using port: {selected_port} @ {BAUD_RATE}")
 
     try:
         while True:
@@ -190,25 +255,25 @@ def main() -> int:
             # CSV format: CPU%,CPU_TEMP_C,RAM%,GPU%,GPU_TEMP_C\n
             line = f"{cpu:.1f},{temp_c:.1f},{ram:.1f},{gpu_usage:.1f},{gpu_temp:.1f}\n"
             if args.dry_run:
-                print(line.strip())
+                log_print(line.strip())
             else:
                 try:
                     ser.write(line.encode('utf-8'))
                     if args.verbose:
-                        print(line.strip())
+                        log_print(line.strip())
                 except Exception as e:
-                    print(f"[warn] Write failed: {e}")
+                    log_print(f"[warn] Write failed: {e}")
                     # Attempt simple reconnect once
                     try:
                         if ser:
                             ser.close()
-                        time.sleep(1.0)
-                        ser = open_serial(port)
+                        time.sleep(0.5)
+                        ser = open_serial(port, args.open_wait)
                     except Exception:
                         pass
             time.sleep(max(0.05, float(args.interval)))
     except KeyboardInterrupt:
-        print("\n[info] Stopped by user")
+        log_print("\n[info] Stopped by user")
     finally:
         try:
             if ser:
