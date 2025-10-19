@@ -44,9 +44,7 @@ $RunnerContent = @"
 `$RepoRoot = Split-Path -Parent `$PSScriptRoot
 `$Pythonw = Join-Path `$RepoRoot '.venv\Scripts\pythonw.exe'
 `$Sender = Join-Path `$RepoRoot 'pc\pc_stats_sender.py'
-`$ScriptArgs = @(
-@({0})
-)
+`$ScriptArgs = @({0})
 # Build argument list: script path + arguments
 `$AllArgs = @(`$Sender) + `$ScriptArgs
 # Start sender hidden (no console) using pythonw

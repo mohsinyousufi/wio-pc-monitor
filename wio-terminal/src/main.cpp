@@ -143,7 +143,7 @@ void drawStaticLayoutOnce() {
 void drawStatus() {
   int y = SCREEN_H - 28;
   tft.fillRect(PADDING, y - 4, SCREEN_W - 2 * PADDING, 28, TFT_BLACK);
-  bool fresh = (millis() - lastRxMillis) < 1500;
+  bool fresh = (millis() - lastRxMillis) < 2500;
   uint16_t dot = fresh ? TFT_GREEN : TFT_RED;
   tft.fillCircle(PADDING + 6, y + 6, 5, dot);
   tft.setCursor(PADDING + 18, y);
