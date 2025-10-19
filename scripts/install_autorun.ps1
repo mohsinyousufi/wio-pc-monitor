@@ -44,11 +44,13 @@ $RunnerContent = @"
 `$RepoRoot = Split-Path -Parent `$PSScriptRoot
 `$Pythonw = Join-Path `$RepoRoot '.venv\Scripts\pythonw.exe'
 `$Sender = Join-Path `$RepoRoot 'pc\pc_stats_sender.py'
-`$Args = @(
+`$ScriptArgs = @(
 @({0})
 )
+# Build argument list: script path + arguments
+`$AllArgs = @(`$Sender) + `$ScriptArgs
 # Start sender hidden (no console) using pythonw
-Start-Process -FilePath `$Pythonw -ArgumentList @(`$Sender) + `$Args -WorkingDirectory `$RepoRoot -WindowStyle Hidden
+Start-Process -FilePath `$Pythonw -ArgumentList `$AllArgs -WorkingDirectory `$RepoRoot -WindowStyle Hidden
 "@ -f ( ($ArgsList | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ', ' )
 Set-Content -LiteralPath $RunnerPath -Value $RunnerContent -Encoding UTF8
 
