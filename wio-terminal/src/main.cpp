@@ -28,10 +28,10 @@ const int BAR_H = 22;
 
 // Precomputed Y positions
 int Y_CPU = 0;
-int Y_TEMP = 0;
-int Y_RAM = 0;
 int Y_GPU = 0;
+int Y_RAM = 0;
 int Y_GPUTEMP = 0;
+int Y_TEMP = 0; 
 
 // Last drawn bar widths (pixels)
 int lastCpuW = -1;
@@ -50,14 +50,14 @@ void drawStaticLabelsAndSlots() {
   tft.setTextSize(2);
   tft.setCursor(PADDING, Y_CPU);
   tft.print("CPU:");
-  tft.setCursor(PADDING, Y_TEMP);
-  tft.print("TEMP:");
   tft.setCursor(PADDING, Y_RAM);
   tft.print("RAM:");
   tft.setCursor(PADDING, Y_GPU);
   tft.print("GPU:");
   tft.setCursor(PADDING, Y_GPUTEMP);
   tft.print("G-TEMP:");
+  tft.setCursor(PADDING, Y_TEMP);
+  tft.print("TEMP:");
 
   // Bar backgrounds
   int bx, bw;
@@ -111,7 +111,7 @@ void drawTemp(int y, float tempC) {
     tft.drawString("N/A", SCREEN_W - PADDING, y);
   } else {
     char buf[24];
-    snprintf(buf, sizeof(buf), "%.1f C", tempC);
+    snprintf(buf, sizeof(buf), "%.0fC", tempC);
     tft.setTextPadding(64);
     tft.drawString(buf, SCREEN_W - PADDING, y);
   }
@@ -132,10 +132,10 @@ void drawStaticLayoutOnce() {
   drawHeader();
   // Compute Y layout
   Y_CPU = PADDING + 28;
-  Y_TEMP = Y_CPU + 32;
-  Y_RAM = Y_TEMP + 28;
+  Y_RAM = Y_CPU + 32;
   Y_GPU = Y_RAM + 32;
   Y_GPUTEMP = Y_GPU + 32;
+  Y_TEMP = Y_GPUTEMP + 32;
   // Draw labels and bar slots once
   drawStaticLabelsAndSlots();
 }
@@ -149,8 +149,7 @@ void drawStatus() {
   tft.setCursor(PADDING + 18, y);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
-  if (receivedOnce) tft.print(fresh ? "RX: fresh" : "RX: stale");
-  else tft.print("Waiting for data...");
+  if (receivedOnce) tft.print(fresh);
 }
 
 void updateBarsAndTemps(const Metrics &m) {
@@ -178,7 +177,7 @@ void updateBarsAndTemps(const Metrics &m) {
     if (m.gpuTempC < 0) tft.drawString("N/A", SCREEN_W - PADDING, Y_GPUTEMP);
     else {
       char buf[24];
-      snprintf(buf, sizeof(buf), "%.1f C", m.gpuTempC);
+      snprintf(buf, sizeof(buf), "%.0fC", m.gpuTempC);
       tft.drawString(buf, SCREEN_W - PADDING, Y_GPUTEMP);
     }
     tft.setTextDatum(TL_DATUM);
