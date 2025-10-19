@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pytest_cache/
+.eggs/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# VS Code
+.vscode/
+
+# PlatformIO
+wio-terminal/.pio/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Generated scripts (safe to re-create)
+scripts/run_sender.ps1

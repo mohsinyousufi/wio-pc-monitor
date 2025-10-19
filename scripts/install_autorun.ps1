@@ -26,10 +26,10 @@ if (!(Test-Path $Python)) {
     & python -m venv (Join-Path $RepoRoot '.venv')
 }
 
-# Install deps
+# Install deps (avoid pip.exe shim issues by using python -m pip)
 Write-Host "Installing requirements..."
 & $Python -m pip install --upgrade pip
-& $Pip install -r $Requirements
+& $Python -m pip install -r $Requirements
 
 # Compose script arguments
 $ArgsList = @()
@@ -41,16 +41,15 @@ if ($VerboseMode) { $ArgsList += @('--verbose') }
 $RunnerPath = Join-Path $RepoRoot 'scripts\run_sender.ps1'
 $RunnerContent = @"
 # Auto-generated runner for Wio PC Monitor sender
-`$RepoRoot = "$RepoRoot"
-`$Python = Join-Path `$RepoRoot '.venv\Scripts\python.exe'
+`$RepoRoot = Split-Path -Parent `$PSScriptRoot
+`$Pythonw = Join-Path `$RepoRoot '.venv\Scripts\pythonw.exe'
 `$Sender = Join-Path `$RepoRoot 'pc\pc_stats_sender.py'
 `$Args = @(
 @({0})
 )
-# Close stale serial monitor processes if any (best-effort)
-# Start sender in a normal window
-Start-Process -FilePath `$Python -ArgumentList @(`$Sender) + `$Args -WindowStyle Normal
-"@ -f ($ArgsList | ForEach-Object { '"' + ($_ -replace '"','\"') + '"' } -join ', ')
+# Start sender hidden (no console) using pythonw
+Start-Process -FilePath `$Pythonw -ArgumentList @(`$Sender) + `$Args -WorkingDirectory `$RepoRoot -WindowStyle Hidden
+"@ -f ( ($ArgsList | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ', ' )
 Set-Content -LiteralPath $RunnerPath -Value $RunnerContent -Encoding UTF8
 
 # Register Scheduled Task
@@ -62,19 +61,11 @@ if ($Interval -ne "") { $argList += @('--interval', $Interval) }
 if ($VerboseMode) { $argList += @('--verbose') }
 $ArgString = $argList -join ' '
 
-# Register Scheduled Task to run pythonw.exe (no console window)
-$Action = New-ScheduledTaskAction -Execute $Pythonw -Argument $ArgString -WorkingDirectory $RepoRoot
+# Register Scheduled Task to run the PowerShell runner (handles quoting/venv; hidden window)
+$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerPath`""
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Description 'Run Wio PC Monitor sender at user logon (background)' -Force -Hidden
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Description 'Run Wio PC Monitor sender at user logon (background)' -Force
 
-Write-Host "Scheduled Task '$TaskName' registered (hidden). It will run at user logon in the background."
-Write-Host "To test quickly: `"$Pythonw`" $ArgString"
-$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$RunnerPath`""
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-# Add 5s delay using repetition trick (workaround for simple delay)
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Description 'Run Wio PC Monitor sender at user logon' -Force
-
-Write-Host "Scheduled Task '$TaskName' registered. It will run at user logon."
-Write-Host "You can test it now: powershell -NoProfile -ExecutionPolicy Bypass -File `"$RunnerPath`""
+Write-Host "Scheduled Task '$TaskName' registered. It will run at user logon in the background."
+Write-Host "You can test it now (optional): powershell -NoProfile -ExecutionPolicy Bypass -File `"$RunnerPath`""
