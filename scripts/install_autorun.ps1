@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
 $Python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+$Pythonw = Join-Path $RepoRoot '.venv\Scripts\pythonw.exe'
 $Pip = Join-Path $RepoRoot '.venv\Scripts\pip.exe'
 $Requirements = Join-Path $RepoRoot 'pc\requirements.txt'
 $Sender = Join-Path $RepoRoot 'pc\pc_stats_sender.py'
@@ -54,6 +55,21 @@ Set-Content -LiteralPath $RunnerPath -Value $RunnerContent -Encoding UTF8
 
 # Register Scheduled Task
 $TaskName = 'Wio PC Monitor Sender'
+$argList = @()
+if ($Sender -ne "") { $argList += '"' + $Sender + '"' }
+if ($Port -ne "") { $argList += @('--port', $Port) }
+if ($Interval -ne "") { $argList += @('--interval', $Interval) }
+if ($VerboseMode) { $argList += @('--verbose') }
+$ArgString = $argList -join ' '
+
+# Register Scheduled Task to run pythonw.exe (no console window)
+$Action = New-ScheduledTaskAction -Execute $Pythonw -Argument $ArgString -WorkingDirectory $RepoRoot
+$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Description 'Run Wio PC Monitor sender at user logon (background)' -Force -Hidden
+
+Write-Host "Scheduled Task '$TaskName' registered (hidden). It will run at user logon in the background."
+Write-Host "To test quickly: `"$Pythonw`" $ArgString"
 $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$RunnerPath`""
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
