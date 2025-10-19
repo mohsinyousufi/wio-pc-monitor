@@ -1,3 +1,5 @@
+# Warning: This is a "vibe-coded" project, please use at your own risk! 
+
 # Wio Terminal PC Monitor
 
 Real-time PC system monitoring display using a Wio Terminal connected via USB serial.
