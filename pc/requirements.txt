@@ -1,0 +1,4 @@
+psutil==5.9.8
+pyserial==3.5
+WMI==1.5.1
+nvidia-ml-py3==7.352.0
