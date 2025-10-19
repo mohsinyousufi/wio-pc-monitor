@@ -1,4 +1,4 @@
-# Warning: This is a "vibe-coded" project, please use at your own risk! 
+# Warning: This is a "vibe-coded" project, please use at your own risk! ..
 
 # Wio Terminal PC Monitor
 
