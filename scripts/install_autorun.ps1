@@ -1,6 +1,7 @@
 param(
     [string]$Port = "",
     [string]$Interval = "0.5",
+    [string]$BleAddress = "",
     [switch]$VerboseMode
 )
 
@@ -65,6 +66,7 @@ if ($Sender -ne "") { $argList += '"' + $Sender + '"' }
 if ($Port -ne "") { $argList += @('--port', $Port) }
 if ($Interval -ne "") { $argList += @('--interval', $Interval) }
 if ($VerboseMode) { $argList += @('--verbose') }
+if ($BleAddress -ne "") { $argList += @('--ble-address', $BleAddress) }
 $ArgString = $argList -join ' '
 
 # Register Scheduled Task to run the PowerShell runner (handles quoting/venv; hidden window)

@@ -8,14 +8,19 @@ from typing import Optional, Tuple
 import psutil
 import serial
 import serial.tools.list_ports
+import asyncio
+from typing import Callable
+try:
+    from bleak import BleakClient
+    BLEAK_AVAILABLE = True
+except Exception:
+    BLEAK_AVAILABLE = False
 
 # On Windows, use WMI for temperatures if available
 IS_WINDOWS = platform.system() == "Windows"
 if IS_WINDOWS:
-    try:
-        import wmi  # type: ignore
-    except Exception:  # pragma: no cover
-        wmi = None  # type: ignore
+    # defer importing wmi to avoid initializing pywin32/pythoncom at module import time
+    wmi = None  # type: ignore
 else:
     wmi = None  # type: ignore
 
@@ -50,13 +55,17 @@ def get_lhm_wmi():
     if LHM_WMI is not None:
         return LHM_WMI
     if not IS_WINDOWS or wmi is None:
-        return None
-    try:
-        LHM_WMI = wmi.WMI(namespace='root\\LibreHardwareMonitor')
-        return LHM_WMI
-    except Exception:
-        LHM_WMI = None
-        return None
+        # Try importing wmi only when we need it
+        try:
+            import wmi as _wmi  # type: ignore
+        except Exception:
+            return None
+        try:
+            LHM_WMI = _wmi.WMI(namespace='root\\LibreHardwareMonitor')
+            return LHM_WMI
+        except Exception:
+            LHM_WMI = None
+            return None
 
 
 def list_ports() -> list[serial.tools.list_ports_common.ListPortInfo]:
@@ -204,6 +213,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print metrics without opening serial")
     parser.add_argument("--list-ports", action="store_true", help="List available serial ports and exit")
     parser.add_argument("--verbose", action="store_true", help="Print each line sent")
+    parser.add_argument("--ble-address", help="BLE peripheral address to connect to (e.g., AA:BB:CC:DD:EE:FF). If provided, sender will attempt BLE write to UART RX char instead of serial.")
     parser.add_argument("--log-file", help="Append logs to this file (optional)")
     parser.add_argument("--open-wait", type=float, default=0.5, help="Seconds to wait after opening serial (default 0.5)")
     parser.add_argument("--open-retries", type=int, default=20, help="Retries to open/find serial before exit (default 20)")
@@ -223,8 +233,16 @@ def main() -> int:
         return 0
 
     ser = None
+    ble_client = None
+    ble_address = args.ble_address
+    BLE_UART_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+    if ble_address and not BLEAK_AVAILABLE:
+        log_print("[error] bleak not installed; --ble-address cannot be used. Install with pip install bleak")
+        return 3
     selected_port: Optional[str] = None
-    if not args.dry_run:
+
+    # If BLE address provided, operate in BLE-only mode and skip serial port open
+    if not args.dry_run and not ble_address:
         attempts = 0
         while attempts < max(1, int(args.open_retries)) and ser is None:
             selected_port = find_serial_port(args.port)
@@ -249,6 +267,21 @@ def main() -> int:
                 log_print(f"  - {p.device}: {p.description}")
         log_print(f"[info] Using port: {selected_port} @ {BAUD_RATE}")
 
+    # If BLE mode requested, connect once and keep client
+    if ble_address:
+        # Synchronous wrapper around bleak client connect/write
+        async def ble_connect(address: str):
+            client = BleakClient(address)
+            await client.connect()
+            return client
+
+        try:
+            ble_client = asyncio.run(ble_connect(ble_address))
+            log_print(f"[info] Connected to BLE {ble_address}")
+        except Exception as e:
+            log_print(f"[error] BLE connect failed: {e}")
+            ble_client = None
+
     try:
         while True:
             cpu, temp_c, ram, gpu_usage, gpu_temp = get_metrics()
@@ -257,20 +290,42 @@ def main() -> int:
             if args.dry_run:
                 log_print(line.strip())
             else:
-                try:
-                    ser.write(line.encode('utf-8'))
-                    if args.verbose:
-                        log_print(line.strip())
-                except Exception as e:
-                    log_print(f"[warn] Write failed: {e}")
-                    # Attempt simple reconnect once
+                if ble_address and ble_client:
+                    # BLE write to UART RX characteristic (peripheral expects this)
                     try:
-                        if ser:
-                            ser.close()
-                        time.sleep(0.5)
-                        ser = open_serial(port, args.open_wait)
-                    except Exception:
-                        pass
+                        async def _ble_write(client: BleakClient, uuid: str, data: bytes):
+                            await client.write_gatt_char(uuid, data)
+
+                        asyncio.run(_ble_write(ble_client, BLE_UART_RX_UUID, line.encode('utf-8')))
+                        if args.verbose:
+                            log_print(f"[ble] {line.strip()}")
+                    except Exception as e:
+                        log_print(f"[warn] BLE write failed: {e}")
+                        # try reconnect
+                        try:
+                            if ble_client and ble_client.is_connected:
+                                asyncio.run(ble_client.disconnect())
+                        except Exception:
+                            pass
+                        try:
+                            ble_client = asyncio.run(ble_connect(ble_address))
+                        except Exception as e:
+                            log_print(f"[warn] BLE reconnect failed: {e}")
+                else:
+                    try:
+                        ser.write(line.encode('utf-8'))
+                        if args.verbose:
+                            log_print(line.strip())
+                    except Exception as e:
+                        log_print(f"[warn] Write failed: {e}")
+                        # Attempt simple reconnect once
+                        try:
+                            if ser:
+                                ser.close()
+                            time.sleep(0.5)
+                            ser = open_serial(selected_port, args.open_wait)
+                        except Exception:
+                            pass
             time.sleep(max(0.05, float(args.interval)))
     except KeyboardInterrupt:
         log_print("\n[info] Stopped by user")
@@ -278,6 +333,11 @@ def main() -> int:
         try:
             if ser:
                 ser.close()
+            if ble_client:
+                try:
+                    asyncio.run(ble_client.disconnect())
+                except Exception:
+                    pass
         except Exception:
             pass
 

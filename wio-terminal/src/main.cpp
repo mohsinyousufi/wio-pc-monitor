@@ -1,6 +1,45 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 
+// Prefer Seeed rpcBLE (rpcBLEDevice) when available; fall back to BluetoothSerial (ESP32), else provide a no-op stub
+#ifdef __has_include
+#  if __has_include(<rpcBLEDevice.h>)
+#    include <rpcBLEDevice.h>
+#    include <BLEServer.h>
+  #    include <BLE2902.h>
+  #    include <BLECharacteristic.h>
+  #    include <string>
+    // Use rpcBLE (Seeed wrapper) which exposes ESP32-style BLE APIs
+    #define RPC_BLE_SUPPORTED 1
+  static BLECharacteristic* metricsCharacteristic = nullptr;
+  // Globals for incoming BLE RX packet
+  static std::string lastBlePacket;
+  static volatile bool haveBlePacket = false;
+  static const bool BT_AVAILABLE = true;
+#  elif __has_include(<BluetoothSerial.h>)
+#    include <BluetoothSerial.h>
+    #define BT_HARDWARE_SUPPORTED 1
+    static BluetoothSerial SerialBT;
+    static const bool BT_AVAILABLE = true;
+#  else
+    // Minimal stub for platforms without Bluetooth/rpcBLE
+    class _NoopBT {
+    public:
+      void begin(const char*) {}
+      void println(const String &s) {(void)s;}
+    };
+    static _NoopBT SerialBT;
+    static const bool BT_AVAILABLE = false;
+#  endif
+#else
+  // If __has_include not available, try rpcBLE by default
+  #include <rpcBLEDevice.h>
+  #include <BLEServer.h>
+  #define RPC_BLE_SUPPORTED 1
+  static BLECharacteristic* metricsCharacteristic = nullptr;
+  static const bool BT_AVAILABLE = true;
+#endif
+
 TFT_eSPI tft = TFT_eSPI();
 
 // UI constants
@@ -149,7 +188,14 @@ void drawStatus() {
   tft.setCursor(PADDING + 18, y);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
-  if (receivedOnce) tft.print(fresh);
+  if (receivedOnce) tft.print(fresh ? "RX: fresh" : "RX: stale");
+  else tft.print("Waiting for data...");
+
+  // Show Bluetooth availability on the right
+  tft.setCursor(SCREEN_W - 88, y);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.print(BT_AVAILABLE ? "BT: available" : "BT: unavailable");
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
 void updateBarsAndTemps(const Metrics &m) {
@@ -187,6 +233,59 @@ void updateBarsAndTemps(const Metrics &m) {
 
 void setup() {
   Serial.begin(115200);
+  #if defined(RPC_BLE_SUPPORTED)
+    // Initialize Seeed rpcBLE (BLE GATT server) with a UART-like service
+    BLEDevice::init("WioMonitor");
+    BLEServer *pServer = BLEDevice::createServer();
+    pServer->setCallbacks(nullptr);
+
+    // UART service UUIDs (commonly used Nordic UART service style)
+    const char* UART_SERVICE = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+    const char* UART_CHAR_RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // central -> peripheral (WRITE)
+    const char* UART_CHAR_TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // peripheral -> central (NOTIFY)
+
+    // Create service and characteristics
+    BLEService *pService = pServer->createService(UART_SERVICE);
+    BLECharacteristic * pTxCharacteristic = pService->createCharacteristic(
+                                          UART_CHAR_TX,
+                                          BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+                                        );
+    pTxCharacteristic->setAccessPermissions(GATT_PERM_READ);
+    pTxCharacteristic->addDescriptor(new BLE2902());
+    metricsCharacteristic = pTxCharacteristic; // expose as global for notifications
+
+    BLECharacteristic * pRxCharacteristic = pService->createCharacteristic(
+                                          UART_CHAR_RX,
+                                          BLECharacteristic::PROPERTY_WRITE
+                                        );
+    pRxCharacteristic->setAccessPermissions(GATT_PERM_READ | GATT_PERM_WRITE);
+
+  // Incoming BLE writes will be handled by this callback which stores the last packet
+    class RxCallbacks: public BLECharacteristicCallbacks {
+      void onWrite(BLECharacteristic *c) {
+        std::string v = c->getValue();
+        if (!v.empty()) {
+          // store into static for loop() to consume
+          lastBlePacket = v;
+          haveBlePacket = true;
+        }
+      }
+    };
+  pRxCharacteristic->setCallbacks(new RxCallbacks());
+
+    pService->start();
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(UART_SERVICE);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);
+    pAdvertising->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+    delay(200);
+  #elif defined(BT_HARDWARE_SUPPORTED)
+  SerialBT.begin("WioMonitor"); // Initialize Bluetooth with device name
+  // Give the radio a moment to become discoverable
+  delay(500);
+  #endif
   tft.init();
   tft.setRotation(3); // landscape
   tft.fillScreen(TFT_BLACK);
@@ -228,6 +327,41 @@ bool parseLine(const String &line, Metrics &out) {
 unsigned long lastRender = 0;
 
 void loop() {
+  // If rpcBLE provided incoming writes, consume them and feed into parser
+#if defined(RPC_BLE_SUPPORTED)
+  if (haveBlePacket) {
+    // Move the data into lineBuf (clip to reasonable length)
+    std::string s = lastBlePacket;
+    if (!s.empty()) {
+      String incoming = String(s.c_str());
+      // Append a newline if missing
+      if (incoming.endsWith("\n") == false) incoming += '\n';
+      // Feed byte-by-byte to the same parser used for Serial
+      for (size_t i = 0; i < incoming.length(); ++i) {
+        char c = incoming.charAt(i);
+        if (c == '\n') {
+          String trimmed = lineBuf;
+          trimmed.trim();
+          Metrics m;
+          if (parseLine(trimmed, m)) {
+            current = m;
+            receivedOnce = true;
+            lastRxMillis = millis();
+            lastLineShown = trimmed;
+            updateBarsAndTemps(current);
+            drawStatus();
+          }
+          lineBuf = "";
+        } else if (c != '\r') {
+          if (lineBuf.length() < 128) lineBuf += c;
+          else lineBuf = "";
+        }
+      }
+    }
+    haveBlePacket = false;
+    lastBlePacket.clear();
+  }
+#endif
   // Read incoming serial line
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -242,6 +376,21 @@ void loop() {
         lastLineShown = trimmed;
         updateBarsAndTemps(current);
         drawStatus();
+
+  // Send data over Bluetooth: either rpcBLE GATT notify or BluetoothSerial
+  String bluetoothData = "CPU:" + String(current.cpu) + ",TEMP:" + String(current.tempC) + ",RAM:" + String(current.ram) + ",GPU:" + String(current.gpu) + ",G-TEMP:" + String(current.gpuTempC);
+#if defined(RPC_BLE_SUPPORTED)
+  if (metricsCharacteristic) {
+    // setValue expects std::string or raw bytes; convert
+    std::string s = std::string((const char*)bluetoothData.c_str(), bluetoothData.length());
+    metricsCharacteristic->setValue(s);
+    metricsCharacteristic->notify();
+  }
+#elif defined(BT_HARDWARE_SUPPORTED)
+  SerialBT.println(bluetoothData);
+#else
+  // noop stub: nothing
+#endif
       }
       lineBuf = "";
     } else if (c != '\r') {

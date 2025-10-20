@@ -1,3 +1,26 @@
+/.venv/
+/.vscode/
+/.pio/
+/wio-terminal/.pio/
+/wio-terminal/.vscode/
+*.user
+*.log
+*.elf
+/.pytest_cache/
+__pycache__/
+*.pyc
+env/
+venv/
+/.idea/
+/.DS_Store
+*.exe
+build/
+dist/
+node_modules/
+
+## Optional: ignore runner generated logs and configs
+/sender.log
+/scripts/runner.conf
 # Python
 __pycache__/
 *.py[cod]
