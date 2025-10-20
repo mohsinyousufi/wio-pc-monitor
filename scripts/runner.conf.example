@@ -1,0 +1,13 @@
+# Example runner.conf for Wio PC Monitor
+# This file is safe to commit. Copy to 'scripts/runner.conf' locally and
+# fill in your local values (do not commit 'scripts/runner.conf' with
+# personal device addresses or absolute paths).
+
+# BLE device address (example format):
+# ble_address=00:11:22:AA:BB:CC
+
+# Optional: default serial port for USB-connected Wio device
+# port=COM3
+
+# Optional: interval (seconds) between samples
+# interval=0.5
