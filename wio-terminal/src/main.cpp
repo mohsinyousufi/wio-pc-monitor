@@ -61,6 +61,10 @@ String lastLineShown;
 bool receivedOnce = false;
 unsigned long lastRxMillis = 0;
 
+// LCD sleep/wake on no data
+bool isLcdOn = true;
+const unsigned long LCD_SLEEP_TIMEOUT_MS = 60UL * 1000UL; // 60 seconds
+
 // Layout constants
 const int LABEL_W = 70;
 const int BAR_H = 22;
@@ -198,6 +202,42 @@ void drawStatus() {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
+// Forward declaration so helpers can call it before its definition
+void updateBarsAndTemps(const Metrics &m);
+
+// Reset cached draw state so next update paints fresh after a clear()
+static inline void resetDrawCaches() {
+  lastCpuW = -1;
+  lastRamW = -1;
+  lastGpuW = -1;
+  lastDrawn.cpu = -1000;
+  lastDrawn.ram = -1000;
+  lastDrawn.gpu = -1000;
+  lastDrawn.tempC = -1000;
+  lastDrawn.gpuTempC = -1000;
+}
+
+// Centralized LCD power control helpers
+static inline void lcdSleep() {
+  if (!isLcdOn) return;
+  tft.fillScreen(TFT_BLACK);      // optional: blank the screen
+  // Use backlight control for LCD off
+  digitalWrite(LCD_BACKLIGHT, LOW);
+  isLcdOn = false;
+}
+
+static inline void lcdWake() {
+  if (isLcdOn) return;
+  // Use backlight control for LCD on
+  digitalWrite(LCD_BACKLIGHT, HIGH);
+  delay(5);
+  drawStaticLayoutOnce();
+  resetDrawCaches();
+  updateBarsAndTemps(current);
+  drawStatus();
+  isLcdOn = true;
+}
+
 void updateBarsAndTemps(const Metrics &m) {
   tft.setTextSize(2);
   // Bars: update only deltas
@@ -327,6 +367,8 @@ bool parseLine(const String &line, Metrics &out) {
 unsigned long lastRender = 0;
 
 void loop() {
+  unsigned long now = millis();
+
   // If rpcBLE provided incoming writes, consume them and feed into parser
 #if defined(RPC_BLE_SUPPORTED)
   if (haveBlePacket) {
@@ -350,6 +392,7 @@ void loop() {
             lastLineShown = trimmed;
             updateBarsAndTemps(current);
             drawStatus();
+            lcdWake();
           }
           lineBuf = "";
         } else if (c != '\r') {
@@ -376,6 +419,7 @@ void loop() {
         lastLineShown = trimmed;
         updateBarsAndTemps(current);
         drawStatus();
+        lcdWake();
 
   // Send data over Bluetooth: either rpcBLE GATT notify or BluetoothSerial
   String bluetoothData = "CPU:" + String(current.cpu) + ",TEMP:" + String(current.tempC) + ",RAM:" + String(current.ram) + ",GPU:" + String(current.gpu) + ",G-TEMP:" + String(current.gpuTempC);
@@ -400,8 +444,14 @@ void loop() {
     }
   }
 
+  // LCD sleep check
+  now = millis();
+  if (isLcdOn && (now - lastRxMillis) > LCD_SLEEP_TIMEOUT_MS) {
+    lcdSleep();
+  }
+
   // Optionally redraw periodically even without new data
-  unsigned long now = millis();
+  now = millis();
   if (now - lastRender > 1000) {
     drawStatus();
     lastRender = now;
