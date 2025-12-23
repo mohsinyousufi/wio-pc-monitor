@@ -3,38 +3,28 @@ import sys
 import time
 import platform
 import atexit
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, Dict
 from bleak import BleakScanner
 
 import psutil
-import serial
-import serial.tools.list_ports
+import requests
+import re
 import asyncio
-from typing import Callable
 try:
     from bleak import BleakClient
     BLEAK_AVAILABLE = True
 except Exception:
     BLEAK_AVAILABLE = False
 
-# On Windows, use WMI for temperatures if available
 IS_WINDOWS = platform.system() == "Windows"
-if IS_WINDOWS:
-    # defer importing wmi to avoid initializing pywin32/pythoncom at module import time
-    wmi = None  # type: ignore
-else:
-    wmi = None  # type: ignore
-
-BAUD_RATE = 115200
 SEND_INTERVAL_SEC = 0.5
 
 
-"""Lightweight, resilient metrics sender.
+"""Lightweight, resilient metrics sender (BLE-only).
 
 Changes:
 - Optional file logging (--log-file)
-- Configurable serial open wait (--open-wait, default 0.5s)
-- Cache LibreHardwareMonitor WMI object across reads
+- Uses LibreHardwareMonitor RemoteWebServer JSON or NVML for GPU
 - Initialize NVML once and reuse handle instead of per-iteration init
 """
 
@@ -46,80 +36,112 @@ except Exception:
     NVML_AVAILABLE = False
 
 # Globals for cached providers
-LHM_WMI = None  # LibreHardwareMonitor WMI connection (if any)
 NVML_INIT = False
 NVML_HANDLE = None
 
-# Try to connect to LibreHardwareMonitor WMI
-def get_lhm_wmi():
-    global LHM_WMI
-    if LHM_WMI is not None:
-        return LHM_WMI
-    if not IS_WINDOWS or wmi is None:
-        # Try importing wmi only when we need it
-        try:
-            import wmi as _wmi  # type: ignore
-        except Exception:
-            return None
-        try:
-            LHM_WMI = _wmi.WMI(namespace='root\\LibreHardwareMonitor')
-            return LHM_WMI
-        except Exception:
-            LHM_WMI = None
-            return None
 
+# --- LibreHardwareMonitor Remote Web Server JSON API ---
+LHM_REMOTE_URL = "http://localhost:8085/data.json"  # Change port if needed
 
-def list_ports() -> list[serial.tools.list_ports_common.ListPortInfo]:
-    return list(serial.tools.list_ports.comports())
-
-
-def find_serial_port(preferred: Optional[str] = None) -> Optional[str]:
-    if preferred:
-        return preferred
-    # Try to auto-detect by common VID/PID/names
-    ports = list_ports()
-    for p in ports:
-        desc = (p.description or "").lower()
-        hwid = (p.hwid or "").lower()
-        if (
-            "seeed" in desc
-            or "wio" in desc
-            or "seeeduino" in desc
-            or "arduino" in desc
-            or "usb serial" in desc
-            or "cdc" in desc
-        ):
-            return p.device
-    # Fallback to first available
-    return ports[0].device if ports else None
-
-
-
-def get_cpu_temp_c_lhm(lhm):
-    """Get CPU temp from LibreHardwareMonitor WMI, or -1 if not found."""
+def fetch_lhm_json():
     try:
-        sensors = lhm.Sensor()
-        cpu_temps = [float(s.Value) for s in sensors if s.SensorType == 'Temperature' and 'core max' in (s.Name or '').lower()]
-        if cpu_temps:
-            return cpu_temps[0]
+        resp = requests.get(LHM_REMOTE_URL, timeout=2)
+        if resp.status_code == 200:
+            data = resp.json()
+            try:
+                # Print a short summary for debugging
+                top_children = data.get('Children', [])
+                print(f"[debug] LHM JSON fetched: {len(top_children)} top children")
+                for entry in top_children:
+                    txt = entry.get('Text') or entry.get('Name') or ''
+                    print(f"  - section: {txt}")
+                # Also search for key sensor ids and print matches
+                def _search(node, path):
+                    if isinstance(node, dict):
+                        if 'id' in node and node.get('id') in (20, 220, 223):
+                            print(f"[debug] MATCH id={node.get('id')} path={'/'.join(path)} Value={node.get('Value')}")
+                        for k, v in node.items():
+                            if isinstance(v, (dict, list)):
+                                _search(v, path + [str(node.get('Text') or node.get('Name') or k)])
+                    elif isinstance(node, list):
+                        for i, item in enumerate(node):
+                            _search(item, path + [f'[{i}]'])
+                try:
+                    _search(data, ['root'])
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return data
     except Exception:
         pass
+    return None
+
+
+# --- Helpers to index and parse sensors ---
+_UNIT_RE = re.compile(r'([-+]?[0-9]*\.?[0-9]+)')
+
+def _parse_numeric(val: Any) -> float:
+    if val is None:
+        return -1.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    m = _UNIT_RE.search(s)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return -1.0
     return -1.0
 
-def get_gpu_metrics_lhm(lhm):
-    """Get (GPU usage %, GPU temp C) from LibreHardwareMonitor WMI, or (-1, -1) if not found."""
+
+def build_sensor_index(tree: Any, out: Dict[int, Dict] | None = None) -> Dict[int, Dict]:
+    if out is None:
+        out = {}
+    if isinstance(tree, dict):
+        sid = tree.get('id')
+        if isinstance(sid, int):
+            out[sid] = tree
+        for v in tree.values():
+            if isinstance(v, (dict, list)):
+                build_sensor_index(v, out)
+    elif isinstance(tree, list):
+        for item in tree:
+            if isinstance(item, (dict, list)):
+                build_sensor_index(item, out)
+    return out
+
+def get_cpu_temp_c_lhm_json(data):
+    """Get CPU temp from LHM JSON, or -1 if not found."""
     try:
-        sensors = lhm.Sensor()
-        # Find first GPU
-        
-        gpu_loads = [float(s.Value) for s in sensors if s.SensorType == 'Load' and 'gpu core' in (s.Name or '').lower()]
-        gpu_temps = [float(s.Value) for s in sensors if s.SensorType == 'Temperature' and 'gpu' in (s.Name or '').lower()]
-        gpu_usage = gpu_loads[0] if gpu_loads else -1.0
-        gpu_temp = gpu_temps[1] if gpu_temps else -1.0
-        # return gpu_temp to 1 decimal place
-        return gpu_usage, round(gpu_temp)
+        idx = build_sensor_index(data)
+        sensor = idx.get(20)
+        if sensor is None:
+            return -1.0
+        val = sensor.get('Value', '')
+        print(f"[debug] CPU sensor id=20 raw Value={val}")
+        return _parse_numeric(val)
+    except Exception:
+        return -1.0
+
+def get_gpu_metrics_lhm_json(data):
+    """Get (GPU usage %, GPU temp C) from LHM JSON, or (-1, -1) if not found."""
+    try:
+        idx = build_sensor_index(data)
+        gpu_temp = _parse_numeric(idx.get(220, {}).get('Value'))
+        gpu_load = _parse_numeric(idx.get(223, {}).get('Value'))
+        print(f"[debug] GPU sensors raw temp={idx.get(220, {}).get('Value')} load={idx.get(223, {}).get('Value')}")
+        return gpu_load, gpu_temp
     except Exception:
         return -1.0, -1.0
+
+
+
+
+
+
+
 
 
 
@@ -163,14 +185,16 @@ def get_gpu_metrics_nvml() -> Tuple[float, float]:
         return -1.0, -1.0
 
 
+
+# --- Metrics collection function ---
 def get_metrics() -> tuple[float, float, float, float, float]:
     cpu = float(psutil.cpu_percent(interval=None))
     ram = float(psutil.virtual_memory().percent)
-    lhm = get_lhm_wmi()
-    if lhm:
-        temp_c = get_cpu_temp_c_lhm(lhm)
-        gpu_usage, gpu_temp = get_gpu_metrics_lhm(lhm)
-        debug_src = 'LHM'
+    lhm_data = fetch_lhm_json()
+    if lhm_data:
+        temp_c = get_cpu_temp_c_lhm_json(lhm_data)
+        gpu_usage, gpu_temp = get_gpu_metrics_lhm_json(lhm_data)
+        debug_src = 'LHM_JSON'
     else:
         temp_c = -1.0
         gpu_usage, gpu_temp = get_gpu_metrics_nvml()
@@ -180,15 +204,7 @@ def get_metrics() -> tuple[float, float, float, float, float]:
     return cpu, temp_c, ram, gpu_usage, gpu_temp
 
 
-def open_serial(port: str, open_wait: float) -> Optional[serial.Serial]:
-    try:
-        ser = serial.Serial(port=port, baudrate=BAUD_RATE, timeout=1)
-        # Give device a brief moment to reset (configurable)
-        time.sleep(max(0.0, float(open_wait)))
-        return ser
-    except Exception as e:
-        log_print(f"[warn] Could not open {port}: {e}")
-        return None
+# serial port functions removed — BLE-only operation
 
 
 LOG_FILE = None  # type: Optional[str]
@@ -208,30 +224,18 @@ def log_print(msg: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send PC stats to Wio Terminal over serial")
-    parser.add_argument("--port", help="COM port (e.g., COM4). If omitted, try auto-detect.")
+    parser = argparse.ArgumentParser(description="Send PC stats to Wio Terminal over BLE")
     parser.add_argument("--interval", type=float, default=SEND_INTERVAL_SEC, help="Send interval seconds (default 0.5s)")
-    parser.add_argument("--dry-run", action="store_true", help="Print metrics without opening serial")
-    parser.add_argument("--list-ports", action="store_true", help="List available serial ports and exit")
+    parser.add_argument("--dry-run", action="store_true", help="Print metrics without sending")
     parser.add_argument("--verbose", action="store_true", help="Print each line sent")
-    parser.add_argument("--ble-address", help="BLE peripheral address to connect to (e.g., AA:BB:CC:DD:EE:FF). If provided, sender will attempt BLE write to UART RX char instead of serial.")
+    parser.add_argument("--ble-address", help="BLE peripheral address to connect to (e.g., AA:BB:CC:DD:EE:FF)")
     parser.add_argument("--log-file", help="Append logs to this file (optional)")
-    parser.add_argument("--open-wait", type=float, default=0.5, help="Seconds to wait after opening serial (default 0.5)")
-    parser.add_argument("--open-retries", type=int, default=20, help="Retries to open/find serial before exit (default 20)")
     args = parser.parse_args()
 
     global LOG_FILE
     LOG_FILE = args.log_file or None
 
-    if args.list_ports:
-        ports = list_ports()
-        if not ports:
-            log_print("No serial ports found.")
-            return 0
-        log_print("Available serial ports:")
-        for p in ports:
-            log_print(f"- {p.device}: {p.description}")
-        return 0
+    # (serial port listing removed; BLE-only mode)
 
 
     def find_wio_ble_address(target_name="WioMonitor", timeout=5.0):
@@ -243,7 +247,7 @@ def main() -> int:
                 return d.address
         print("Wio Terminal not found via BLE scan.")
         return None
-    ser = None
+
     ble_client = None
     ble_address = args.ble_address
     if not ble_address:
@@ -252,109 +256,94 @@ def main() -> int:
             log_print("[error] Could not auto-detect Wio Terminal BLE address.")
             return 4
     BLE_UART_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-    if ble_address and not BLEAK_AVAILABLE:
+    if not BLEAK_AVAILABLE:
         log_print("[error] bleak not installed; --ble-address cannot be used. Install with pip install bleak")
         return 3
-    selected_port: Optional[str] = None
 
-    # If BLE address provided, operate in BLE-only mode and skip serial port open
-    if not args.dry_run and not ble_address:
-        attempts = 0
-        while attempts < max(1, int(args.open_retries)) and ser is None:
-            selected_port = find_serial_port(args.port)
-            if not selected_port:
-                log_print(f"[warn] No serial port found (attempt {attempts+1}). Retrying...")
-                attempts += 1
-                time.sleep(1.0)
-                continue
-            ser = open_serial(selected_port, args.open_wait)
-            if not ser:
-                log_print(f"[warn] Open failed for {selected_port} (attempt {attempts+1}). Retrying...")
-                attempts += 1
-                time.sleep(1.0)
-        if not ser:
-            log_print("[error] Could not open serial port after retries. Exiting.")
-            return 2
-        # Show a quick summary of ports and selection
-        ports = list_ports()
-        if ports:
-            log_print("[info] Ports detected:")
-            for p in ports:
-                log_print(f"  - {p.device}: {p.description}")
-        log_print(f"[info] Using port: {selected_port} @ {BAUD_RATE}")
 
-    # If BLE mode requested, connect once and keep client
-    if ble_address:
-        # Synchronous wrapper around bleak client connect/write
-        async def ble_connect(address: str):
-            print(f"[debug] Attempting BLE connect to {address}")
-            client = BleakClient(address)
-            await client.connect()
-            print(f"[debug] BLE connected: {client.is_connected}")
-            return client
-
+    # BLE service scanner
+    async def ble_service_scan(address: str):
+        print(f"[debug] Scanning GATT services for {address}")
         try:
-            ble_client = asyncio.run(ble_connect(ble_address))
-            log_print(f"[info] Connected to BLE {ble_address}")
+            async with BleakClient(address) as client:
+                print(f"[debug] Connected: {client.is_connected}")
+                # Try both Bleak APIs for service discovery
+                services = None
+                try:
+                    # Newer Bleak: client.services (after connect)
+                    services = client.services
+                except Exception:
+                    pass
+                if not services:
+                    try:
+                        # Older Bleak: await client.get_services()
+                        services = await client.get_services()
+                    except Exception:
+                        pass
+                if not services:
+                    print("[error] Could not retrieve GATT services (both APIs failed)")
+                    return
+                print(f"[debug] Services for {address}:")
+                for service in services:
+                    print(f"  Service: {service.uuid} | {getattr(service, 'description', '')}")
+                    for char in service.characteristics:
+                        print(f"    Characteristic: {char.uuid} | {getattr(char, 'description', '')} | Properties: {getattr(char, 'properties', '')}")
         except Exception as e:
-            log_print(f"[error] BLE connect failed: {e}")
-            ble_client = None
+            print(f"[error] Service scan failed: {e}")
+
+    # BLE connect helper
+    async def ble_connect(address: str):
+        print(f"[debug] Attempting BLE connect to {address}")
+        client = BleakClient(address)
+        await client.connect()
+        print(f"[debug] BLE connected: {client.is_connected}")
+        return client
+
+
+    # First, scan and print all services/characteristics for debugging
+    print("[info] Running BLE service scan for debugging...")
+    asyncio.run(ble_service_scan(ble_address))
+
+    try:
+        ble_client = asyncio.run(ble_connect(ble_address))
+        log_print(f"[info] Connected to BLE {ble_address}")
+    except Exception as e:
+        log_print(f"[error] BLE connect failed: {e}")
+        return 5
 
     try:
         while True:
             cpu, temp_c, ram, gpu_usage, gpu_temp = get_metrics()
-            # CSV format: CPU%,CPU_TEMP_C,RAM%,GPU%,GPU_TEMP_C\n
             line = f"{cpu:.1f},{temp_c:.1f},{ram:.1f},{gpu_usage:.1f},{gpu_temp:.1f}\n"
             if args.dry_run:
                 log_print(line.strip())
             else:
-                if ble_address and ble_client:
-                    # BLE write to UART RX characteristic (peripheral expects this)
+                # Print parsed metric values before sending
+                log_print(f"[send] CPU%={cpu:.1f} CPU_TEMP_C={temp_c:.1f} RAM%={ram:.1f} GPU%={gpu_usage:.1f} GPU_TEMP_C={gpu_temp:.1f}")
+                
+                try:
+                    async def _ble_write(client: BleakClient, uuid: str, data: bytes):
+                        await client.write_gatt_char(uuid, data)
+                    asyncio.run(_ble_write(ble_client, BLE_UART_RX_UUID, line.encode('utf-8')))
+                    if args.verbose:
+                        log_print(f"[ble] {line.strip()}")
+                except Exception as e:
+                    log_print(f"[warn] BLE write failed: {e}")
+                    # try reconnect
                     try:
-                        async def _ble_write(client: BleakClient, uuid: str, data: bytes):
-                            # print(f"[debug] BLE writing to {uuid}: {data}")
-                            await client.write_gatt_char(uuid, data)
-                            # print(f"[debug] BLE write done")
-
-                        asyncio.run(_ble_write(ble_client, BLE_UART_RX_UUID, line.encode('utf-8')))
-                        if args.verbose:
-                            log_print(f"[ble] {line.strip()}")
-                    except Exception as e:
-                        log_print(f"[warn] BLE write failed: {e}")
-                        # try reconnect
-                        try:
-                            if ble_client and ble_client.is_connected:
-                                # print("[debug] BLE disconnecting for reconnect")
-                                asyncio.run(ble_client.disconnect())
-                        except Exception:
-                            pass
-                        try:
-                            # print(f"[debug] BLE reconnecting to {ble_address}")
-                            ble_client = asyncio.run(ble_connect(ble_address))
-                        except Exception as e:
-                            log_print(f"[warn] BLE reconnect failed: {e}")
-                else:
+                        if ble_client and ble_client.is_connected:
+                            asyncio.run(ble_client.disconnect())
+                    except Exception:
+                        pass
                     try:
-                        ser.write(line.encode('utf-8'))
-                        if args.verbose:
-                            log_print(line.strip())
+                        ble_client = asyncio.run(ble_connect(ble_address))
                     except Exception as e:
-                        log_print(f"[warn] Write failed: {e}")
-                        # Attempt simple reconnect once
-                        try:
-                            if ser:
-                                ser.close()
-                            time.sleep(0.5)
-                            ser = open_serial(selected_port, args.open_wait)
-                        except Exception:
-                            pass
+                        log_print(f"[warn] BLE reconnect failed: {e}")
             time.sleep(max(0.05, float(args.interval)))
     except KeyboardInterrupt:
         log_print("\n[info] Stopped by user")
     finally:
         try:
-            if ser:
-                ser.close()
             if ble_client:
                 try:
                     asyncio.run(ble_client.disconnect())

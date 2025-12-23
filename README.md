@@ -20,22 +20,26 @@ Real-time PC system monitoring display using a Wio Terminal connected via USB se
 
 ## Setup — Python sender
 
+This project now runs in BLE-only mode by default. A cleaned, minimal set of runtime dependencies is provided at `pc/requirements_clean.txt`.
+
 1. Install Python dependencies:
 
 ```powershell
 # In the repo root
-python -m venv .venv ; .\.venv\Scripts\Activate.ps1 ; pip install -r .\pc\requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r .\pc\requirements_clean.txt
 ```
 
-2. Find your Wio Terminal COM port (after plugging it in). Common names: `COM3`, `COM4`, etc.
+2. Find your Wio Terminal BLE address (script will auto-discover if not provided).
 
-3. Run the sender (replace the port if known; otherwise it will try to auto-detect):
+3. Run the sender (dry-run prints metrics; default sends via BLE):
 
 ```powershell
-# Known port
-python .\pc\pc_stats_sender.py --port COM4
+# Dry run (no BLE send)
+python .\pc\pc_stats_sender.py --dry-run
 
-# Or let it auto-detect (tries to find a Seeed/Wio device)
+# Send via BLE (auto-discover)
 python .\pc\pc_stats_sender.py
 ```
 
