@@ -4,6 +4,7 @@ import time
 import platform
 import atexit
 from typing import Optional, Tuple
+from bleak import BleakScanner
 
 import psutil
 import serial
@@ -232,9 +233,24 @@ def main() -> int:
             log_print(f"- {p.device}: {p.description}")
         return 0
 
+
+    def find_wio_ble_address(target_name="WioMonitor", timeout=5.0):
+        print(f"Scanning for BLE devices named '{target_name}'...")
+        devices = asyncio.run(BleakScanner.discover(timeout=timeout))
+        for d in devices:
+            if d.name and target_name.lower() in d.name.lower():
+                print(f"Found Wio Terminal: {d.name} [{d.address}]")
+                return d.address
+        print("Wio Terminal not found via BLE scan.")
+        return None
     ser = None
     ble_client = None
     ble_address = args.ble_address
+    if not ble_address:
+        ble_address = find_wio_ble_address()
+        if not ble_address:
+            log_print("[error] Could not auto-detect Wio Terminal BLE address.")
+            return 4
     BLE_UART_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
     if ble_address and not BLEAK_AVAILABLE:
         log_print("[error] bleak not installed; --ble-address cannot be used. Install with pip install bleak")
@@ -271,8 +287,10 @@ def main() -> int:
     if ble_address:
         # Synchronous wrapper around bleak client connect/write
         async def ble_connect(address: str):
+            print(f"[debug] Attempting BLE connect to {address}")
             client = BleakClient(address)
             await client.connect()
+            print(f"[debug] BLE connected: {client.is_connected}")
             return client
 
         try:
@@ -294,7 +312,9 @@ def main() -> int:
                     # BLE write to UART RX characteristic (peripheral expects this)
                     try:
                         async def _ble_write(client: BleakClient, uuid: str, data: bytes):
+                            # print(f"[debug] BLE writing to {uuid}: {data}")
                             await client.write_gatt_char(uuid, data)
+                            # print(f"[debug] BLE write done")
 
                         asyncio.run(_ble_write(ble_client, BLE_UART_RX_UUID, line.encode('utf-8')))
                         if args.verbose:
@@ -304,10 +324,12 @@ def main() -> int:
                         # try reconnect
                         try:
                             if ble_client and ble_client.is_connected:
+                                # print("[debug] BLE disconnecting for reconnect")
                                 asyncio.run(ble_client.disconnect())
                         except Exception:
                             pass
                         try:
+                            # print(f"[debug] BLE reconnecting to {ble_address}")
                             ble_client = asyncio.run(ble_connect(ble_address))
                         except Exception as e:
                             log_print(f"[warn] BLE reconnect failed: {e}")

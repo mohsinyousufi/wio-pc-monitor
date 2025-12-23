@@ -192,13 +192,13 @@ void drawStatus() {
   tft.setCursor(PADDING + 18, y);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
-  if (receivedOnce) tft.print(fresh ? "RX: fresh" : "RX: stale");
+  if (receivedOnce) tft.print(fresh ? " " : " ");
   else tft.print("Waiting for data...");
 
   // Show Bluetooth availability on the right
   tft.setCursor(SCREEN_W - 88, y);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.print(BT_AVAILABLE ? "BT: available" : "BT: unavailable");
+  tft.print(BT_AVAILABLE ? "" : "x");
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
