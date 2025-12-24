@@ -235,12 +235,15 @@ def main() -> int:
     global LOG_FILE
     LOG_FILE = args.log_file or None
 
-    # (serial port listing removed; BLE-only mode)
+    BLE_UART_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 
+    if not BLEAK_AVAILABLE:
+        log_print("[error] bleak not installed; --ble-address cannot be used. Install with pip install bleak")
+        return 3
 
-    def find_wio_ble_address(target_name="WioMonitor", timeout=5.0):
+    async def async_find_wio_ble_address(target_name: str = "WioMonitor", timeout: float = 5.0):
         print(f"Scanning for BLE devices named '{target_name}'...")
-        devices = asyncio.run(BleakScanner.discover(timeout=timeout))
+        devices = await BleakScanner.discover(timeout=timeout)
         for d in devices:
             if d.name and target_name.lower() in d.name.lower():
                 print(f"Found Wio Terminal: {d.name} [{d.address}]")
@@ -248,38 +251,19 @@ def main() -> int:
         print("Wio Terminal not found via BLE scan.")
         return None
 
-    ble_client = None
-    ble_address = args.ble_address
-    if not ble_address:
-        ble_address = find_wio_ble_address()
-        if not ble_address:
-            log_print("[error] Could not auto-detect Wio Terminal BLE address.")
-            return 4
-    BLE_UART_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-    if not BLEAK_AVAILABLE:
-        log_print("[error] bleak not installed; --ble-address cannot be used. Install with pip install bleak")
-        return 3
-
-
-    # BLE service scanner
-    async def ble_service_scan(address: str):
+    async def service_scan(address: str):
         print(f"[debug] Scanning GATT services for {address}")
         try:
             async with BleakClient(address) as client:
                 print(f"[debug] Connected: {client.is_connected}")
-                # Try both Bleak APIs for service discovery
                 services = None
                 try:
-                    # Newer Bleak: client.services (after connect)
-                    services = client.services
+                    services = client.services or await client.get_services()
                 except Exception:
-                    pass
-                if not services:
                     try:
-                        # Older Bleak: await client.get_services()
                         services = await client.get_services()
                     except Exception:
-                        pass
+                        services = None
                 if not services:
                     print("[error] Could not retrieve GATT services (both APIs failed)")
                     return
@@ -291,68 +275,84 @@ def main() -> int:
         except Exception as e:
             print(f"[error] Service scan failed: {e}")
 
-    # BLE connect helper
-    async def ble_connect(address: str):
-        print(f"[debug] Attempting BLE connect to {address}")
-        client = BleakClient(address)
-        await client.connect()
-        print(f"[debug] BLE connected: {client.is_connected}")
-        return client
+    async def connect_with_retries(address: str, max_retries: int = 5) -> Optional[BleakClient]:
+        delay = 0.5
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"[debug] Attempt {attempt} to connect to {address}")
+                client = BleakClient(address)
+                await client.connect()
+                if client.is_connected:
+                    print(f"[debug] Connected on attempt {attempt}")
+                    return client
+                else:
+                    await client.disconnect()
+            except Exception as e:
+                print(f"[debug] Connect attempt {attempt} failed: {e}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 5)
+        return None
 
+    async def async_main():
+        ble_address = args.ble_address
+        if not ble_address:
+            ble_address = await async_find_wio_ble_address()
+            if not ble_address:
+                log_print("[error] Could not auto-detect Wio Terminal BLE address.")
+                return 4
 
-    # First, scan and print all services/characteristics for debugging
-    print("[info] Running BLE service scan for debugging...")
-    asyncio.run(ble_service_scan(ble_address))
+        print("[info] Running BLE service scan for debugging...")
+        await service_scan(ble_address)
 
-    try:
-        ble_client = asyncio.run(ble_connect(ble_address))
-        log_print(f"[info] Connected to BLE {ble_address}")
-    except Exception as e:
-        log_print(f"[error] BLE connect failed: {e}")
-        return 5
+        ble_client: Optional[BleakClient] = None
+        try:
+            ble_client = await connect_with_retries(ble_address)
+            if not ble_client:
+                log_print(f"[error] BLE connect failed after retries to {ble_address}")
+                return 5
+            log_print(f"[info] Connected to BLE {ble_address}")
 
-    try:
-        while True:
-            cpu, temp_c, ram, gpu_usage, gpu_temp = get_metrics()
-            line = f"{cpu:.1f},{temp_c:.1f},{ram:.1f},{gpu_usage:.1f},{gpu_temp:.1f}\n"
-            if args.dry_run:
-                log_print(line.strip())
-            else:
-                # Print parsed metric values before sending
-                log_print(f"[send] CPU%={cpu:.1f} CPU_TEMP_C={temp_c:.1f} RAM%={ram:.1f} GPU%={gpu_usage:.1f} GPU_TEMP_C={gpu_temp:.1f}")
-                
-                try:
-                    async def _ble_write(client: BleakClient, uuid: str, data: bytes):
-                        await client.write_gatt_char(uuid, data)
-                    asyncio.run(_ble_write(ble_client, BLE_UART_RX_UUID, line.encode('utf-8')))
-                    if args.verbose:
-                        log_print(f"[ble] {line.strip()}")
-                except Exception as e:
-                    log_print(f"[warn] BLE write failed: {e}")
-                    # try reconnect
+            while True:
+                cpu, temp_c, ram, gpu_usage, gpu_temp = await asyncio.to_thread(get_metrics)
+                line = f"{cpu:.1f},{temp_c:.1f},{ram:.1f},{gpu_usage:.1f},{gpu_temp:.1f}\n"
+                if args.dry_run:
+                    log_print(line.strip())
+                else:
+                    log_print(f"[send] CPU%={cpu:.1f} CPU_TEMP_C={temp_c:.1f} RAM%={ram:.1f} GPU%={gpu_usage:.1f} GPU_TEMP_C={gpu_temp:.1f}")
                     try:
-                        if ble_client and ble_client.is_connected:
-                            asyncio.run(ble_client.disconnect())
+                        await ble_client.write_gatt_char(BLE_UART_RX_UUID, line.encode('utf-8'))
+                        if args.verbose:
+                            log_print(f"[ble] {line.strip()}")
+                    except Exception as e:
+                        log_print(f"[warn] BLE write failed: {e}")
+                        try:
+                            if ble_client and ble_client.is_connected:
+                                await ble_client.disconnect()
+                        except Exception:
+                            pass
+                        ble_client = await connect_with_retries(ble_address)
+                        if not ble_client:
+                            log_print("[warn] BLE reconnect failed; will retry sending after backoff")
+                await asyncio.sleep(max(0.05, float(args.interval)))
+        except asyncio.CancelledError:
+            log_print("\n[info] Stopped by user")
+        finally:
+            try:
+                if ble_client:
+                    try:
+                        await ble_client.disconnect()
                     except Exception:
                         pass
-                    try:
-                        ble_client = asyncio.run(ble_connect(ble_address))
-                    except Exception as e:
-                        log_print(f"[warn] BLE reconnect failed: {e}")
-            time.sleep(max(0.05, float(args.interval)))
+            except Exception:
+                pass
+        return 0
+
+    # Run the single async main loop
+    try:
+        return asyncio.run(async_main())
     except KeyboardInterrupt:
         log_print("\n[info] Stopped by user")
-    finally:
-        try:
-            if ble_client:
-                try:
-                    asyncio.run(ble_client.disconnect())
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    return 0
+        return 0
 
 
 if __name__ == "__main__":
