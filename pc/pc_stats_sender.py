@@ -112,9 +112,41 @@ def build_sensor_index(tree: Any, out: Dict[int, Dict] | None = None) -> Dict[in
                 build_sensor_index(item, out)
     return out
 
+
+def build_sensorid_index(tree: Any, out: Dict[str, Dict] | None = None) -> Dict[str, Dict]:
+    """Build an index of sensors keyed by their string `SensorId` (if present).
+
+    This walks the deeply nested LHM JSON tree and returns a mapping from
+    SensorId (string) to the sensor dict so callers can lookup by the
+    SensorId path like '/gpu-nvidia/0/temperature/0'.
+    """
+    if out is None:
+        out = {}
+    if isinstance(tree, dict):
+        sid = tree.get('SensorId')
+        if isinstance(sid, str):
+            out[sid] = tree
+        for v in tree.values():
+            if isinstance(v, (dict, list)):
+                build_sensorid_index(v, out)
+    elif isinstance(tree, list):
+        for item in tree:
+            if isinstance(item, (dict, list)):
+                build_sensorid_index(item, out)
+    return out
+
 def get_cpu_temp_c_lhm_json(data):
     """Get CPU temp from LHM JSON, or -1 if not found."""
     try:
+        # Prefer lookup by SensorId (deeply nested path), fall back to numeric id
+        sid_idx = build_sensorid_index(data)
+        cpu_sid = "/lpc/nct6701d/0/temperature/0"
+        sensor = sid_idx.get(cpu_sid)
+        if sensor is not None:
+            val = sensor.get('Value', '')
+            print(f"[debug] CPU sensor SensorId={cpu_sid} raw Value={val}")
+            return _parse_numeric(val)
+        # Fallback to legacy numeric id-based lookup
         idx = build_sensor_index(data)
         sensor = idx.get(20)
         if sensor is None:
@@ -128,6 +160,26 @@ def get_cpu_temp_c_lhm_json(data):
 def get_gpu_metrics_lhm_json(data):
     """Get (GPU usage %, GPU temp C) from LHM JSON, or (-1, -1) if not found."""
     try:
+        # Prefer lookup by SensorId; these paths are used by LHM for GPU sensors
+        sid_idx = build_sensorid_index(data)
+        gpu_temp_sid = "/gpu-nvidia/0/temperature/0"
+        gpu_load_sid = "/gpu-nvidia/0/load/0"
+        # Look up temp
+        gtemp_sensor = sid_idx.get(gpu_temp_sid)
+        if gtemp_sensor is not None:
+            gpu_temp = _parse_numeric(gtemp_sensor.get('Value'))
+        else:
+            gpu_temp = -1.0
+        # Look up load
+        gload_sensor = sid_idx.get(gpu_load_sid)
+        if gload_sensor is not None:
+            gpu_load = _parse_numeric(gload_sensor.get('Value'))
+        else:
+            gpu_load = -1.0
+        if gtemp_sensor is not None or gload_sensor is not None:
+            print(f"[debug] GPU sensors SensorId temp={gtemp_sensor.get('Value') if gtemp_sensor else None} load={gload_sensor.get('Value') if gload_sensor else None}")
+            return gpu_load, gpu_temp
+        # Fallback to numeric ids used previously
         idx = build_sensor_index(data)
         gpu_temp = _parse_numeric(idx.get(221, {}).get('Value'))
         gpu_load = _parse_numeric(idx.get(224, {}).get('Value'))
@@ -135,14 +187,6 @@ def get_gpu_metrics_lhm_json(data):
         return gpu_load, gpu_temp
     except Exception:
         return -1.0, -1.0
-
-
-
-
-
-
-
-
 
 
 def init_nvml_once() -> None:
