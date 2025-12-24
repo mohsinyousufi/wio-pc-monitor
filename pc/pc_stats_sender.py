@@ -270,6 +270,8 @@ def log_print(msg: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send PC stats to Wio Terminal over BLE")
     parser.add_argument("--interval", type=float, default=SEND_INTERVAL_SEC, help="Send interval seconds (default 0.5s)")
+    # Compatibility: some runners pass --open-wait; accept and ignore it
+    parser.add_argument("--open-wait", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help="Print metrics without sending")
     parser.add_argument("--verbose", action="store_true", help="Print each line sent")
     parser.add_argument("--ble-address", help="BLE peripheral address to connect to (e.g., AA:BB:CC:DD:EE:FF)")
