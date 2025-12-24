@@ -58,7 +58,7 @@ def fetch_lhm_json():
                 # Also search for key sensor ids and print matches
                 def _search(node, path):
                     if isinstance(node, dict):
-                        if 'id' in node and node.get('id') in (20, 220, 223):
+                        if 'id' in node and node.get('id') in (20, 221, 224):
                             print(f"[debug] MATCH id={node.get('id')} path={'/'.join(path)} Value={node.get('Value')}")
                         for k, v in node.items():
                             if isinstance(v, (dict, list)):
@@ -129,9 +129,9 @@ def get_gpu_metrics_lhm_json(data):
     """Get (GPU usage %, GPU temp C) from LHM JSON, or (-1, -1) if not found."""
     try:
         idx = build_sensor_index(data)
-        gpu_temp = _parse_numeric(idx.get(220, {}).get('Value'))
-        gpu_load = _parse_numeric(idx.get(223, {}).get('Value'))
-        print(f"[debug] GPU sensors raw temp={idx.get(220, {}).get('Value')} load={idx.get(223, {}).get('Value')}")
+        gpu_temp = _parse_numeric(idx.get(221, {}).get('Value'))
+        gpu_load = _parse_numeric(idx.get(224, {}).get('Value'))
+        print(f"[debug] GPU sensors raw temp={idx.get(221, {}).get('Value')} load={idx.get(224, {}).get('Value')}")
         return gpu_load, gpu_temp
     except Exception:
         return -1.0, -1.0
